@@ -7,7 +7,6 @@ import nltk
 import inflect
 from transformers import AutoTokenizer
 from torchvision import transforms as T
-from collections import defaultdict
 import pdb
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
@@ -17,26 +16,12 @@ from maskrcnn_benchmark.structures.bounding_box import BoxList
 from maskrcnn_benchmark import layers as L
 from maskrcnn_benchmark.modeling.roi_heads.mask_head.inference import Masker
 from maskrcnn_benchmark.utils import cv2_util
-from maskrcnn_benchmark.data.datasets.evaluation import evaluate, im_detect_bbox_aug
-from maskrcnn_benchmark.config import cfg
-from transformers import AutoTokenizer
-from transformers import CLIPTokenizerFast
-
 
 engine = inflect.engine()
-
 nltk.download('punkt')
 nltk.download('averaged_perceptron_tagger')
 
-cfg.merge_from_file("configs/pretrain/glip_Swin_T_O365_GoldG.yaml")
-
 import timeit
-
-def clean_name(name):
-    name = re.sub(r"\(.*\)", "", name)
-    name = re.sub(r"_", " ", name)
-    name = re.sub(r"  ", " ", name)
-    return name
 
 
 class GLIPDemo(object):
@@ -110,6 +95,7 @@ class GLIPDemo(object):
         if cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "bert-base-uncased":
             tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
         elif cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "clip":
+            from transformers import CLIPTokenizerFast
             if cfg.MODEL.DYHEAD.FUSE_CONFIG.MLM_LOSS:
                 tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
                                                               from_slow=True, mask_token='ðŁĴĳ</w>')
@@ -147,11 +133,11 @@ class GLIPDemo(object):
 
     def run_on_web_image(self, 
             original_image, 
-            original_caption,
+            original_caption, 
             thresh=0.5,
             custom_entity = None,
             alpha = 0.0):
-        predictions = self.compute_prediction_OD(original_image, original_caption, custom_entity)
+        predictions = self.compute_prediction(original_image, original_caption, custom_entity)
         top_predictions = self._post_process(predictions, thresh)
 
         result = original_image.copy()
@@ -169,9 +155,9 @@ class GLIPDemo(object):
             thresh=0.5,
             alpha=0.0,
             box_pixel=3,
-            text_size = 0.75,
+            text_size = 1,
             text_pixel = 2,
-            text_offset = 5,
+            text_offset = 10,
             text_offset_original = 4,
             color = 255):
         self.color = color
@@ -182,175 +168,11 @@ class GLIPDemo(object):
         result = original_image.copy()
         if self.show_mask_heatmaps:
             return self.create_mask_montage(result, top_predictions)
-        result = self.overlay_boxes(result, top_predictions)
+        result = self.overlay_boxes(result, top_predictions, alpha=alpha, box_pixel=box_pixel)
         result = self.overlay_entity_names(result, top_predictions, text_size=text_size, text_pixel=text_pixel, text_offset = text_offset, text_offset_original = text_offset_original)
         if self.cfg.MODEL.MASK_ON:
             result = self.overlay_mask(result, top_predictions)
         return result, top_predictions
-
-
-    def create_queries_and_maps(self, labels, label_list, additional_labels = None, cfg = None):
-    
-        # Clean label list
-        original_label_list = label_list.copy()
-        label_list = [clean_name(i) for i in label_list]
-        # Form the query and get the mapping
-        tokens_positive = []
-        start_i = 0
-        end_i = 0
-        objects_query = ""
-    
-        # sep between tokens, follow training
-        separation_tokens = cfg.DATASETS.SEPARATION_TOKENS
-    
-        caption_prompt = cfg.DATASETS.CAPTION_PROMPT
-        if caption_prompt is not None and isinstance(caption_prompt, str):
-            caption_prompt = load_from_yaml_file(caption_prompt)
-        use_caption_prompt = cfg.DATASETS.USE_CAPTION_PROMPT and caption_prompt is not None
-        for _index, label in enumerate(label_list):
-            if use_caption_prompt:
-                objects_query += caption_prompt[_index]["prefix"]
-    
-            start_i = len(objects_query)
-    
-            if use_caption_prompt:
-                objects_query += caption_prompt[_index]["name"]
-            else:
-                objects_query += label
-    
-            end_i = len(objects_query)
-            tokens_positive.append([(start_i, end_i)])  # Every label has a [(start, end)]
-    
-            if use_caption_prompt:
-                objects_query += caption_prompt[_index]["suffix"]
-    
-            if _index != len(label_list) - 1:
-                objects_query += separation_tokens
-    
-        if additional_labels is not None:
-            objects_query += separation_tokens
-            for _index, label in enumerate(additional_labels):
-                objects_query += label
-                if _index != len(additional_labels) - 1:
-                    objects_query += separation_tokens
-    
-        print(objects_query)
-    
-        # tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        if cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "bert-base-uncased":
-            if cfg.MODEL.DYHEAD.FUSE_CONFIG.MLM_LOSS:
-                tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
-                                                                            from_slow=True, mask_token='ðŁĴĳ</w>')
-            else:
-                tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
-                                                                            from_slow=True)
-            tokenized = tokenizer(objects_query,
-                                  max_length=cfg.MODEL.LANGUAGE_BACKBONE.MAX_QUERY_LEN,
-                                  truncation=True,
-                                  return_tensors="pt")
-        else:
-            tokenizer = None
-            raise NotImplementedError
-    
-        # Create the mapping between tokenized sentence and the original label
-        positive_map_token_to_label, positive_map_label_to_token = self.create_positive_dict(tokenized, tokens_positive,
-                                                                                            labels=labels)  # from token position to original label
-        return objects_query, positive_map_label_to_token
-
-    def create_positive_dict(self, tokenized, tokens_positive, labels):
-        """construct a dictionary such that positive_map[i] = j, iff token i is mapped     to j label"""
-        positive_map = defaultdict(int)
-    
-        # Additionally, have positive_map_label_to_tokens
-        positive_map_label_to_token = defaultdict(list)
-    
-        for j, tok_list in enumerate(tokens_positive):
-            for (beg, end) in tok_list:
-                beg_pos = tokenized.char_to_token(beg)
-                end_pos = tokenized.char_to_token(end - 1)
-                if beg_pos is None:
-                    try:
-                        beg_pos = tokenized.char_to_token(beg + 1)
-                        if beg_pos is None:
-                            beg_pos = tokenized.char_to_token(beg + 2)
-                    except:
-                        beg_pos = None
-                if end_pos is None:
-                    try:
-                        end_pos = tokenized.char_to_token(end - 2)
-                        if end_pos is None:
-                            end_pos = tokenized.char_to_token(end - 3)
-                    except:
-                        end_pos = None
-                if beg_pos is None or end_pos is None:
-                    continue
-    
-                assert beg_pos is not None and end_pos is not None
-                for i in range(beg_pos, end_pos + 1):
-                    positive_map[i] = labels[j]  # because the labels starts from 1
-                    positive_map_label_to_token[labels[j]].append(i)
-                # positive_map[j, beg_pos : end_pos + 1].fill_(1)
-        return positive_map, positive_map_label_to_token 
-
-
-    def create_queries_and_maps_from_dataset(self, categories, cfg):
-        #one_hot = dataset.one_hot
-        labels = []
-        label_list = []
-        keys = list(categories.keys())
-        keys.sort()
-        for i in keys:
-            labels.append(i)
-            label_list.append(categories[i])
-    
-        labels = [labels]
-        label_list = [label_list]
-    
-        all_queries = []
-        all_positive_map_label_to_token = []
-    
-        for i in range(len(labels)):
-            labels_i = labels[i]
-            label_list_i = label_list[i]
-            query_i, positive_map_label_to_token_i = self.create_queries_and_maps(
-                labels_i, label_list_i, additional_labels = cfg.DATASETS.SUPRESS_QUERY if cfg.DATASETS.USE_SUPRESS_QUERY else None, cfg = cfg)
-    
-            all_queries.append(query_i)
-            all_positive_map_label_to_token.append(positive_map_label_to_token_i)
-        return all_queries, all_positive_map_label_to_token
-
-
-    def compute_prediction_OD(self, original_image, original_caption, custom_entity = None):
-        image = self.transforms(original_image)
-        device = 'cuda'
-        cpu_device = torch.device("cpu")
-        image_list = to_image_list(image, self.cfg.DATALOADER.SIZE_DIVISIBILITY)
-        image_list = image_list.to(self.device)
-        all_queries, all_positive_map_label_to_token = self.create_queries_and_maps_from_dataset(original_caption, cfg)
-        self.entities = all_queries[0].split('.')
-
-        tic = timeit.time.perf_counter()
-        # compute predictions
-        with torch.no_grad():
-            images = image_list.to(device)
-            query_time = len(all_queries)
-            for query_i in range(query_time):
-                captions = [all_queries[query_i]]
-                positive_map_label_to_token = all_positive_map_label_to_token[query_i]
-                output = self.model(images, captions=captions, positive_map=positive_map_label_to_token)
-                output = [o.to(cpu_device) for o in output]
-
-        print("inference time per image: {}".format(timeit.time.perf_counter() - tic))
-
-        # always single image is passed at a time
-        prediction = output[0]
-
-        # reshape prediction (a BoxList) into the original image size
-        height, width = original_image.shape[:-1]
-        prediction = prediction.resize((width, height))
-
-
-        return prediction
 
     def compute_prediction(self, original_image, original_caption, custom_entity = None):
         # image
@@ -358,7 +180,6 @@ class GLIPDemo(object):
         image_list = to_image_list(image, self.cfg.DATALOADER.SIZE_DIVISIBILITY)
         image_list = image_list.to(self.device)
         # caption
-        self.entities = original_caption
         if isinstance(original_caption, list):
             # we directly provided a list of category names
             caption_string = ""
@@ -459,12 +280,12 @@ class GLIPDemo(object):
         colors = (30 * (labels[:, None] - 1) + 1) * self.palette
         colors = (colors % 255).numpy().astype("uint8")
         try:
-            colors = (colors + self.color).astype("uint8")
+            colors = (colors * 0 + self.color).astype("uint8")
         except:
             pass
         return colors
 
-    def overlay_boxes(self, image, predictions, alpha=0.7, box_pixel = 3):
+    def overlay_boxes(self, image, predictions, alpha=0.5, box_pixel = 3):
         labels = predictions.get_field("labels")
         boxes = predictions.bbox
 
@@ -497,7 +318,6 @@ class GLIPDemo(object):
         scores = predictions.get_field("scores").tolist()
         labels = predictions.get_field("labels").tolist()
         new_labels = []
-        print(self.entities)
         if self.cfg.MODEL.RPN_ARCHITECTURE == "VLDYHEAD":
             plus = 1
         else:
@@ -524,7 +344,7 @@ class GLIPDemo(object):
                     y -= text_offset
 
             cv2.putText(
-                image, s, (int(x), int(y)-text_offset_original), cv2.FONT_HERSHEY_SIMPLEX, text_size, (255, 255, 255), text_pixel, cv2.LINE_AA
+                image, s, (int(x), int(y)-text_offset_original), cv2.FONT_HERSHEY_SIMPLEX, text_size, (self.color, self.color, self.color), text_pixel, cv2.LINE_AA
             )
             previous_locations.append((int(x), int(y)))
 
